@@ -3,7 +3,7 @@
    componentes da biblioteca conectada "Anota Treino - Biblioteca". Só roda no arquivo "HOME".
    Não cria fluxos nem interações. Ao rodar de novo, apaga só a página que ele mesmo criou e refaz.
    Botão Diagnóstico: só lê a biblioteca e o arquivo, não muda nada. */
-const PLUGIN_BUILD = 'v1.0 · 2026-11-12';
+const PLUGIN_BUILD = 'v1.1 · 2026-11-12';
 const FILE_NAME = 'HOME';
 const LIB_NAME = 'Anota Treino - Biblioteca';
 const UI_URL = 'https://estudio-orsi.github.io/anota-treino-home-plugin/index.html';
@@ -13,7 +13,7 @@ const W = 393, H = 852;
 // ---------------------------------------------------------------- utils + log
 const LOG = [], ERRORS = [], ERRLIST = [], WARNINGS = [];
 const STATS = { pages: 0, screens: 0, copies: 0, texts: 0, flexBoards: 0, interactions: 0, flows: 0, arrows: 0,
-  textOverrides: 0, textOverridesFixed: 0, textOverridesFailed: 0, variantFallbacks: 0, implicitFlowsRemoved: 0, layoutWarnings: 0, layoutWaits: 0, layoutWaitTimeouts: 0, drawings: 0 };
+  textOverrides: 0, textOverridesFixed: 0, textOverridesFailed: 0, variantFallbacks: 0, implicitFlowsRemoved: 0, layoutWarnings: 0, layoutWaits: 0, layoutWaitTimeouts: 0, drawings: 0, textsChecked: 0, textFinalRedone: 0, textRemeasured: 0, textFinalMismatch: 0 };
 const USED = {};   // component key -> count
 const FALLBACKS = [];   // {set, requested, used, available}
 let CTX = { page: '', screen: '' };
@@ -289,8 +289,31 @@ function findIn(root, path) {
   }
   return cur;
 }
+function walkAll(x, fn) { fn(x); for (const k of kidsOf(x)) walkAll(k, fn); }
+// Ícone da biblioteca em outro tamanho (como o ícone do selo de XP do AppHeader, 16 px). Os vetores escalam com o quadro; se não escalarem, corrige à mão.
+function scaleIcon(inst, size) {
+  const w0 = safe(() => inst.width, 24); if (Math.abs(w0 - size) < 0.1) return;
+  const before = []; walkAll(inst, (x) => { if (x !== inst) before.push([x, safe(() => x.width, 0), safe(() => x.height, 0)]); });
+  inst.resize(size, size);
+  const k = size / w0; let ok = true;
+  for (const b of before) { if (b[1] > 0.5 && Math.abs(safe(() => b[0].width, 0) - b[1] * k) > 0.2) { ok = false; break; } }
+  if (!ok) for (const b of before) tryDo('ícone escala manual', () => { const px = b[0].parentX, py = b[0].parentY; b[0].resize(Math.max(b[1] * k, 0.01), Math.max(b[2] * k, 0.01)); b[0].parentX = px * k; b[0].parentY = py * k; });
+}
+// Pinta os vetores do ícone com uma cor da biblioteca (traços em "stroke …", preenchimentos em "fill …").
+function colorIcon(inst, token) {
+  walkAll(inst, (x) => {
+    if (x === inst || safe(() => x.type, '') !== 'path') return;
+    const role = String(safe(() => x.name, '') || '').split(' ')[0];
+    if (role === 'fill') { tryDo('ícone fill', () => { x.fills = [fill(token)]; }); return; }
+    if (role === 'bg') return;
+    let w = 2, cap = null;
+    try { const st = x.strokes && x.strokes[0]; if (st) { w = st.strokeWidth || 2; cap = st.strokeCapStart || null; } } catch (e) {}
+    tryDo('ícone traço', () => { x.strokes = [stroke(token, w, 'center', cap ? { strokeCapStart: cap, strokeCapEnd: cap } : {})]; });
+  });
+}
 const NAV = [];   // {shape, to}
 const OVR = [];   // textos trocados nas cópias, para conferir depois
+const ALLTXT = [];   // todos os textos da montagem (criados e trocados), para a conferência final
 let SCREEN_SHAPES = {};
 function build(n, parent, avail) {
   let s = null;
@@ -332,6 +355,7 @@ function build(n, parent, avail) {
       s = penpot.createText(n.text);
       if (!s) throw new Error('createText devolveu null para "' + n.text + '"');
       STATS.texts++;
+      ALLTXT.push({ shape: s, value: n.text, kind: 'criado', name: n.name || n.text.slice(0, 40), screen: CTX.screen });
       s.name = n.name || n.text.slice(0, 40);
       const ty = TYPOS[n.typo];
       if (ty) tryDo('typo ' + n.typo, () => ty.applyToText(s));
@@ -351,6 +375,8 @@ function build(n, parent, avail) {
       s = comp.instance();
       if (!s) throw new Error('instance() devolveu null para ' + n.set);
       STATS.copies++;
+      if (n.size) tryDo('tamanho do ícone', () => scaleIcon(s, n.size));
+      if (n.color) tryDo('cor do ícone', () => colorIcon(s, n.color));
       const key = n.set + (Object.keys(n.props).length ? ' (' + Object.keys(n.props).map(k => k + '=' + n.props[k]).join(', ') + ')' : '');
       USED[key] = (USED[key] || 0) + 1;
       if (n.name) tryDo('name', () => { s.name = n.name; });
@@ -360,8 +386,10 @@ function build(n, parent, avail) {
         const tx = findIn(s, p);
         if (!tx || tx.type !== 'text') { err('texto', new Error('"' + p + '" não achado em ' + n.set), { component: n.set, requested: n.props, layer: p }); continue; }
         STATS.textOverrides++;
+        const before = { text: safe(() => tx.characters, ''), w: safe(() => tx.width, 0), grow: safe(() => tx.growType, ''), fs: parseFloat(safe(() => tx.fontSize, '')) || 12 };
         tryDo('characters ' + p, () => { tx.characters = String(v); }, { component: n.set, layer: p });
-        OVR.push({ shape: tx, value: String(v), component: n.set, layer: p, screen: CTX.screen });
+        const rec = { shape: tx, value: String(v), component: n.set, layer: p, screen: CTX.screen, before: before, kind: 'trocado', name: (n.name || n.set) + ' › ' + p };
+        OVR.push(rec); ALLTXT.push(rec);
       }
       for (const p of (n.hide || [])) {
         const h = findIn(s, p);
@@ -459,6 +487,10 @@ const NAV_PT = { 'Tab Home/Label': 'Home', 'Tab Workout/Label': 'Treinar', 'Tab 
 const BottomNav = () => C('BottomNav', { Active: 'home' }, { name: 'Menu', w: 'fill', texts: NAV_PT });
 const ProfileHeader = () => C('AppHeader', { Variant: 'profile' }, { name: 'Cabeçalho', w: 'fill',
   texts: { 'Heading/Overline': D.hello, 'Heading/Title': D.name, 'Actions/XP badge/XP': D.xp, 'Actions/Avatar/Initials': D.initials } });
+// Selo de XP igual ao do AppHeader (contorno border, pílula, chama 16 px na cor brand, texto body/xs-medium).
+// Texto criado pelo plugin, não trocado numa cópia: no Penpot, o texto do Badge trocado na cópia ficou mostrando "Badge".
+const XpBadge = () => F({ name: 'XP badge', dir: 'row', gap: 6, ai: 'center', p: [0, 10], h: 28, stroke: 'border', r: 9999 }, [
+  Icon('flame', { name: 'Icon', size: 16, color: 'brand' }), T(D.xp, 'body/xs-medium', 'foreground', { name: 'XP' })]);
 const Icon = (name, o) => C('Icon / ' + name, {}, Object.assign({ name: 'Ícone ' + name }, o || {}));
 const Label = (t, color) => T(t, 'label/xs', color || 'muted-foreground', { name: 'Rótulo ' + t });
 const LivesLink = () => T(D.lives, 'body/sm-medium', 'brand', { name: 'Mais vidas' });   // oferta de vidas (na home real é um texto que abre a oferta)
@@ -516,7 +548,7 @@ function v2() {
     F({ name: 'Cabeçalho', dir: 'row', w: 'fill', p: [24, 16, 12, 16], ai: 'start', jc: 'space-between' }, [
       T(D.hello + '\n' + D.name, 'display/4xl', 'foreground', { name: 'Saudação' }),
       F({ name: 'Ações', dir: 'row', gap: 10, ai: 'center' }, [
-        C('Badge', { Variant: 'outline' }, { name: 'XP', texts: { Label: D.xp } }),
+        XpBadge(),
         C('Avatar', { Size: 'md', Type: 'initials' }, { name: 'Avatar', texts: { Initials: D.initials } })])]),
     Body({ gap: 12, p: [4, 16, 16, 16] }, [
       Panel('Resumo', { dir: 'row', gap: 14, p: [14, 16, 14, 16], r: 16 }, [
@@ -757,8 +789,44 @@ async function buildHomePage(page) {
   CTX.screen = '';
   // garantia: este plugin não cria fluxos; se o Penpot tiver criado algum nesta página, sai
   for (const f of (safe(() => page.flows, []) || [])) { try { f.remove(); STATS.implicitFlowsRemoved++; } catch (e) { err('remover fluxo', e); } }
+  await finalTextCheck();
   if (made.length) focus(made);
 }
+// Conferência final, depois de tudo assentar: cada texto tem que mostrar exatamente o valor pedido.
+// 1) conteúdo diferente -> refaz e, se continuar diferente, vira erro "texto final diferente";
+// 2) texto trocado numa cópia que ficou com a medida do texto antigo (o Penpot não redesenhou) -> força nova medida e avisa.
+function looksStale(o) {
+  const b = o.before; if (!b || b.grow !== 'auto-width' || b.text === o.value) return false;
+  const w = safe(() => o.shape.width, 0);
+  const m = { fs: b.fs, lh: 1.3, fw: 500, ls: 0, up: false };
+  const dOld = textWidth(b.text, m), dNew = textWidth(o.value, m);
+  return Math.abs(dNew - dOld) > 4 && Math.abs(w - b.w) < 0.5;
+}
+async function finalTextCheck() {
+  await settle(null, 12000); await sleep(1200);
+  let refeitos = 0, medidas = 0;
+  const redo = [];
+  for (const o of ALLTXT) {
+    const now = safe(() => o.shape.characters, null);
+    if (now !== o.value) { redo.push(o); tryDo('refazer texto ' + o.name, () => { o.shape.characters = o.value; }); refeitos++; warn('texto refeito no fim', { name: o.name, screen: o.screen, expected: o.value, found: now }); continue; }
+    if (looksStale(o)) {
+      redo.push(o); medidas++;
+      warn('texto com medida antiga', { name: o.name, screen: o.screen, value: o.value, width: safe(() => o.shape.width, 0), widthBefore: o.before.w, textBefore: o.before.text });
+      tryDo('nova medida ' + o.name, () => { o.shape.characters = o.value + ' '; });
+    }
+  }
+  if (medidas) { await settle(null, 8000); for (const o of redo) if (looksStaleBusy(o)) tryDo('nova medida 2 ' + o.name, () => { o.shape.characters = o.value; }); }
+  if (redo.length) { await settle(null, 12000); await sleep(800); }
+  let diff = 0, stale = 0;
+  for (const o of ALLTXT) {
+    const now = safe(() => o.shape.characters, null);
+    if (now !== o.value) { diff++; err('texto final diferente', new Error('"' + now + '" em vez de "' + o.value + '"'), { name: o.name, screen: o.screen, expected: o.value, found: now }); }
+    else if (looksStale(o)) { stale++; err('texto final sem redesenhar', new Error('"' + o.value + '" ficou com a largura do texto antigo "' + o.before.text + '"'), { name: o.name, screen: o.screen, width: safe(() => o.shape.width, 0) }); }
+  }
+  STATS.textsChecked = ALLTXT.length; STATS.textFinalRedone = refeitos; STATS.textRemeasured = medidas; STATS.textFinalMismatch = diff + stale;
+  say('Conferência dos textos: ' + ALLTXT.length + ' conferidos · ' + (diff + stale) + ' diferentes do pedido.');
+}
+function looksStaleBusy(o) { return safe(() => o.shape.characters, '') === o.value + ' '; }
 
 // ---------------------------------------------------------------- run
 let running = false;
@@ -773,7 +841,7 @@ async function run() {
   const t0 = Date.now();
   for (const k in STATS) STATS[k] = 0;
   for (const k in USED) delete USED[k];
-  ERRORS.length = 0; ERRLIST.length = 0; WARNINGS.length = 0; FALLBACKS.length = 0; LOG.length = 0; CTX = { page: '', screen: '' }; SETTLE_TIMEOUTS_IN_A_ROW = 0;
+  ERRORS.length = 0; ERRLIST.length = 0; ALLTXT.length = 0; WARNINGS.length = 0; FALLBACKS.length = 0; LOG.length = 0; CTX = { page: '', screen: '' }; SETTLE_TIMEOUTS_IN_A_ROW = 0;
   try {
     try { penpot.flags.naturalChildOrdering = true; } catch (e) { err('flags', e); }
     const chk = fileCheck();
@@ -790,7 +858,7 @@ async function run() {
     const secs = Math.round((Date.now() - t0) / 1000);
     const summary = 'Concluído em ' + secs + ' s. Páginas: ' + STATS.pages + ' · telas: ' + STATS.screens + ' · cópias: ' + STATS.copies +
       ' · erros: ' + ERRORS.length + ' · variantes não achadas: ' + STATS.variantFallbacks +
-      ' · textos refeitos: ' + STATS.textOverridesFixed + ' · avisos de layout: ' + STATS.layoutWarnings;
+      ' · textos refeitos: ' + (STATS.textOverridesFixed + STATS.textFinalRedone) + ' · textos conferidos no fim: ' + STATS.textsChecked + ' (diferentes do pedido: ' + STATS.textFinalMismatch + ')' + ' · avisos de layout: ' + STATS.layoutWarnings;
     say(summary, { finished: true, errors: ERRORS.slice(0, 300), stats: STATS, used: USED, log: buildLog(t0) });
   } catch (e) {
     err('run', e);
